@@ -75,8 +75,8 @@ arrive more than once; the dedupe guard makes reprocessing a no-op.
 
 Unlike a database-backed store, the set resets on every restart or redeploy.
 That's fine for the starter — the server's retry window is short, and duplicate
-*submissions* are harmless anyway (the API tags them `accepted_duplicate`; the
-last accepted POST before the deadline wins). If you want dedupe that survives
+*submissions* are harmless anyway (the API tags them `accepted_duplicate` and
+ignores them at scoring — only your first accepted POST counts). If you want dedupe that survives
 restarts, add a Railway Redis or Postgres service and key on `Webhook-Id`.
 
 ## Not included by design
