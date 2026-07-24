@@ -32,7 +32,7 @@ from fastapi import FastAPI, Request, Response
 from explaining_markets import WebhookVerificationError, verify_webhook
 from explaining_markets.client import submit_predictions
 from explaining_markets.config import Config
-from explaining_markets.event_utils import is_test, log_deadline
+from explaining_markets.event_utils import is_test, log_deadline, neutral_predictions
 from predict import predict
 
 app = FastAPI(title="Explaining Markets starter")
@@ -69,9 +69,21 @@ async def competition_webhook(request: Request) -> Response:
     if webhook_id and webhook_id in _seen_webhooks:
         return Response(status_code=200)
 
-    # The portal's "Test Webhook" button sends a synthetic TEST event — ACK
-    # it so the smoke test passes, but don't predict or submit.
+    # The portal's "Test Webhook" button sends a synthetic TEST event. Submit
+    # a neutral prediction for it (accepted by the API, never scored) so the
+    # test verifies your full receive → submit loop, then ACK. A submit
+    # failure must not fail the ACK — the delivery itself succeeded, and the
+    # portal will report "delivered, but no prediction received" so you know
+    # the submit path needs fixing.
     if is_test(event):
+        try:
+            submit_predictions(
+                event_id=event["event_id"],
+                predictions=neutral_predictions(event),
+                config=config,
+            )
+        except Exception as exc:
+            print(f"[WARN] test prediction failed to submit: {exc}")
         if webhook_id:
             _seen_webhooks.add(webhook_id)
         return Response(status_code=200)
