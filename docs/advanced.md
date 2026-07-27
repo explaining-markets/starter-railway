@@ -55,29 +55,52 @@ which is why `app.py` can import it in production. Two consequences:
 The start command is `python app.py`, which binds `0.0.0.0:$PORT` — Railway
 injects `PORT` and healthchecks `GET /` before routing traffic to a new deploy.
 
-## Why synchronous (no queue) in v1
+## Two clocks: 20 seconds to ACK, 5 minutes to predict
 
-`app.py` verifies → predicts → submits → ACKs 200, all in one request. Your
-per-event deadline starts when you ACK 200, so you've always submitted before the
-clock starts. This is the simplest correct design.
+`app.py` verifies → ACKs 200 → predicts and submits in a background task. The
+platform runs two independent timers:
 
-If your `predict()` becomes slow (long LLM chains, multiple tools) and webhook
-deliveries start timing out, move to a queue: ACK 200 immediately, push the
-verified event onto a queue (e.g. a Railway Redis service), and process + submit
-in a separate worker service. Keep the `Webhook-Id` dedupe guard — retries still
-happen.
+| Clock | Budget | Starts | Miss it and… |
+|---|---|---|---|
+| Delivery ACK | 20 s | when the platform POSTs to you | the delivery is retried up to 5 times over ~30 min; 5 consecutive failures emails your admins, ~50 disables your webhook |
+| Prediction window | 5 min | when you ACK 200 | your prediction is tagged late and dropped at scoring |
+
+The 5-minute window only opens once you ACK. Predicting before the ACK spends it
+inside the 20-second budget — a 25-second model call is fine against your
+prediction window and a hard failure against your delivery budget.
+
+Once you ACK, the platform considers the delivery done and will not redeliver, so
+a crash or redeploy mid-flight loses that event's prediction. `predict.py` retries
+the model call once for this reason. To make the work itself durable, push the
+verified event onto a queue (e.g. a Railway Redis service) and process it in a
+separate worker service.
+
+Background tasks run in FastAPI's worker threadpool, which is why
+`_predict_and_submit` in `app.py` is a plain `def` and not `async def` — blocking
+httpx and OpenAI calls in an `async def` task would run on the event loop and
+stall every other delivery arriving at the same time.
 
 ## Idempotency
 
-Deliveries are deduped on the `Webhook-Id` header (equal to `event["id"]`) via an
-in-memory set. The server retries on 5xx and timeout, so the same event can
-arrive more than once; the dedupe guard makes reprocessing a no-op.
+Deliveries are deduped on the `Webhook-Id` header (equal to `event["id"]`), which
+is stable across retries. The guard has three states:
 
-Unlike a database-backed store, the set resets on every restart or redeploy.
-That's fine for the starter — the server's retry window is short, and duplicate
-*submissions* are harmless anyway (the API tags them `accepted_duplicate` and
-ignores them at scoring — only your first accepted POST counts). If you want dedupe that survives
-restarts, add a Railway Redis or Postgres service and key on `Webhook-Id`.
+* **in flight** — claimed on arrival, before any work. A duplicate landing while
+  the first job runs is skipped, so you never pay for the same model call twice.
+* **done** — set only after the API accepts your prediction. Permanent.
+* **released** — if the job raises, the claim is dropped, so the next delivery of
+  that `Webhook-Id` re-runs it.
+
+Marking an event done up front would be the bug: a failed prediction would look
+handled.
+
+A replay of an older event arrives with a fresh `Webhook-Id`, so a "done" marker
+never blocks one.
+
+The store is an in-memory dict behind a lock and resets on restart or redeploy.
+That's fine for a starter — duplicate submissions are harmless (the API tags them
+`accepted_duplicate`; only your first accepted POST is scored). For dedupe that
+survives restarts, add a Railway Redis or Postgres service keyed on `Webhook-Id`.
 
 ## Not included by design
 

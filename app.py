@@ -4,7 +4,7 @@ This is plumbing — you shouldn't need to edit it. It defines a small FastAPI a
 that Railway runs as a persistent, public web service:
 
     GET  /    health check (Railway's healthcheckPath)
-    POST /    receive a signed event, verify, predict, submit
+    POST /    receive a signed event, verify, ACK, then predict and submit
               (POST /competition/webhook is kept as an alias of the same handler)
 
 The webhook is served at the root path on purpose: the URL `railway domain`
@@ -13,21 +13,28 @@ prints *is* your webhook URL — paste it into the portal as-is, nothing to appe
 Deploy:    railway up
 Dev/local: uv run uvicorn app:app --reload
 
-The webhook handler is synchronous: it verifies the signature, runs your
-`predict()` from predict.py, submits the result, and only then ACKs with 200.
-That's safe because your per-event deadline starts when you ACK 200 — so you've
-always submitted before the clock starts. Deliveries are deduped on the
-`Webhook-Id` header (the server retries on 5xx/timeout, so the same event can
-arrive more than once).
+The webhook handler ACKs first, then predicts. It verifies the signature, returns
+200, and runs your `predict()` from predict.py plus the submission in the
+background. Two clocks:
+
+  * 20 seconds to ACK the delivery. Miss it and the platform retries; repeated
+    failures disable your webhook.
+  * 5 minutes from that ACK to submit your prediction.
+
+Predicting before the ACK spends the 5-minute budget inside the 20-second one.
+
+Deliveries are deduped on the `Webhook-Id` header (the server retries on
+4xx/5xx/timeout, so the same event can arrive more than once).
 """
 
 import os
+import threading
 
 from dotenv import load_dotenv
 
 load_dotenv()  # local runs read .env; on Railway, variables come from the service
 
-from fastapi import FastAPI, Request, Response
+from fastapi import BackgroundTasks, FastAPI, Request, Response
 
 from explaining_markets import WebhookVerificationError, verify_webhook
 from explaining_markets.client import submit_predictions
@@ -37,10 +44,65 @@ from predict import predict
 
 app = FastAPI(title="Explaining Markets starter")
 
-# In-memory idempotency cache keyed on the Webhook-Id header. It resets on
-# restart/redeploy, which is fine for a starter — the server's retry window is
-# short. For durable dedupe options, see docs/advanced.md.
-_seen_webhooks: set[str] = set()
+# Idempotency guard keyed on the Webhook-Id header, with three states:
+#
+#   "in_flight"   a job is running right now — skip duplicates so you never pay
+#                 for the same model call twice
+#   "done"        the API accepted a prediction — skip forever
+#   absent        never seen, or the last attempt raised — (re)run it
+#
+# Marking an event done up front would be the bug: a failed prediction would
+# look handled. In-memory, so it resets on restart or redeploy; see
+# docs/advanced.md for durable options.
+_seen_lock = threading.Lock()
+_seen_webhooks: dict[str, str] = {}
+
+
+def _claim(webhook_id: str | None) -> bool:
+    """Reserve this webhook_id. False means it's already in flight or done."""
+    if not webhook_id:
+        return True
+    with _seen_lock:
+        if webhook_id in _seen_webhooks:
+            return False
+        _seen_webhooks[webhook_id] = "in_flight"
+        return True
+
+
+def _release(webhook_id: str | None, *, submitted: bool) -> None:
+    """Mark the claim done on success, or drop it so a redelivery can retry."""
+    if not webhook_id:
+        return
+    with _seen_lock:
+        if submitted:
+            _seen_webhooks[webhook_id] = "done"
+        else:
+            _seen_webhooks.pop(webhook_id, None)
+
+
+def _predict_and_submit(event: dict, config: Config, webhook_id: str | None) -> None:
+    """Run the model and submit the prediction. Synchronous on purpose.
+
+    FastAPI runs *sync* background tasks in a worker thread, so the blocking
+    httpx and OpenAI calls in here never touch the event loop. Making this
+    `async def` would put them back on it and stall every other delivery
+    arriving at the same time.
+    """
+    submitted = False
+    try:
+        predictions = neutral_predictions(event) if is_test(event) else predict(event)
+        submit_predictions(
+            event_id=event["event_id"],
+            predictions=predictions,
+            config=config,
+        )
+        submitted = True
+    except Exception as exc:
+        # The delivery was ACKed already, so nothing upstream will retry this.
+        # Log loudly — `railway logs` is where you'll find it.
+        print(f"[ERROR] prediction failed for event {event.get('event_id')}: {exc}")
+    finally:
+        _release(webhook_id, submitted=submitted)
 
 
 @app.get("/")
@@ -50,7 +112,9 @@ def health() -> dict:
 
 @app.post("/")
 @app.post("/competition/webhook")  # alias, so an explicit-path URL also works
-async def competition_webhook(request: Request) -> Response:
+async def competition_webhook(
+    request: Request, background_tasks: BackgroundTasks
+) -> Response:
     config = Config.from_env()
 
     raw_body = await request.body()  # raw bytes — never request.json()
@@ -63,41 +127,16 @@ async def competition_webhook(request: Request) -> Response:
     except WebhookVerificationError as exc:
         return Response(content=str(exc), status_code=401)
 
-    # Idempotency: the Webhook-Id header (== event["id"]) is stable across
-    # retries. Skip anything we've already handled.
     webhook_id = event.get("id")
-    if webhook_id and webhook_id in _seen_webhooks:
-        return Response(status_code=200)
-
-    # The portal's "Test Webhook" button sends a synthetic TEST event. Submit
-    # a neutral prediction for it (accepted by the API, never scored) so the
-    # test verifies your full receive → submit loop, then ACK. A submit
-    # failure must not fail the ACK — the delivery itself succeeded, and the
-    # portal will report "delivered, but no prediction received" so you know
-    # the submit path needs fixing.
-    if is_test(event):
-        try:
-            submit_predictions(
-                event_id=event["event_id"],
-                predictions=neutral_predictions(event),
-                config=config,
-            )
-        except Exception as exc:
-            print(f"[WARN] test prediction failed to submit: {exc}")
-        if webhook_id:
-            _seen_webhooks.add(webhook_id)
+    if not _claim(webhook_id):
         return Response(status_code=200)
 
     log_deadline(event)
-    predictions = predict(event)
-    submit_predictions(
-        event_id=event["event_id"],
-        predictions=predictions,
-        config=config,
-    )
-
-    if webhook_id:
-        _seen_webhooks.add(webhook_id)
+    # Everything slow happens after this 200 goes out. The portal's "Test
+    # Webhook" button sends a synthetic TEST event; it takes the same path and
+    # submits a neutral prediction (accepted by the API, never scored) so the
+    # test exercises your full receive -> submit loop.
+    background_tasks.add_task(_predict_and_submit, event, config, webhook_id)
     return Response(status_code=200)
 
 
